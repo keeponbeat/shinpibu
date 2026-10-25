@@ -17,9 +17,13 @@
   button.rec.on { background: #a33; }
   label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
   #status { color: var(--muted); margin-left: auto; }
+  /* 消音ボタン：画面の右上に固定。スクロールしてもついてくる */
+  #mute { position: fixed; top: 16px; right: 16px; z-index: 10; padding: 10px 16px; font-size: 18px; background: rgba(20,26,46,0.9); box-shadow: 0 2px 10px rgba(0,0,0,0.4); }
+  #mute.off { border-color: #a33; }
 </style>
 </head>
 <body>
+<button id="mute" aria-pressed="false">🔊 音あり</button>
 <main>
   <canvas id="c1" width="1920" height="1080"></canvas>
   <canvas id="c2" width="1920" height="1080"></canvas>
@@ -255,7 +259,7 @@ function makeScene(canvasId, { D, aStart = 0, bStart = 180, bDir, note, formulaA
     if (!showLabels) return;
     const last = markAt(lastT);
     if (last) {
-      text(`θ = ${last.t}° のとき`, 80, 890, 30, COLOR.muted);
+      text(`θ = ${last.t}° のとき`, 80, 885, 44, COLOR.text);
       ctx.shadowColor = '#fff3c4';
       ctx.shadowBlur = 24 * k;
       text(`AB = ${last.root}${last.exact}`, 80, 950, 46, COLOR.gold);
@@ -520,7 +524,18 @@ document.getElementById('reset').onclick = () => { theta = 0; flash(0); };
 const speedInput = document.getElementById('speed');
 speedInput.oninput = () => { speed = +speedInput.value; document.getElementById('speedVal').textContent = speed; };
 document.getElementById('labels').onchange = e => { showLabels = e.target.checked; };
-document.getElementById('sound').onchange = e => { soundOn = e.target.checked; };
+// 音のオンオフ：右上の消音ボタンと、操作パネルの「太鼓の音」はいつも同じ状態にそろえる
+const muteBtn = document.getElementById('mute');
+const soundBox = document.getElementById('sound');
+function setSound(on) {
+  soundOn = on;
+  soundBox.checked = on;
+  muteBtn.textContent = on ? '🔊 音あり' : '🔇 消音中';
+  muteBtn.classList.toggle('off', !on);
+  muteBtn.setAttribute('aria-pressed', String(!on));
+}
+muteBtn.onclick = () => setSound(!soundOn);
+soundBox.onchange = e => setSound(e.target.checked);
 document.addEventListener('keydown', e => {
   if (e.code === 'Space' && !['INPUT', 'SELECT'].includes(e.target.tagName)) { e.preventDefault(); togglePlay(); }
 });
