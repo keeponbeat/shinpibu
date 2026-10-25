@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>二円の回転 ver3</title>
+<style>
+  :root { --bg:#0b0f1e; --panel:#141a2e; --text:#e8e2cc; --muted:#8a8ba0; --gold:#d4af37; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: "Yu Gothic UI", "Hiragino Sans", sans-serif; }
+  main { max-width: 1280px; margin: 0 auto; padding: 16px; }
+  canvas { width: 100%; height: auto; display: block; border-radius: 8px; background: #070a14; margin-bottom: 16px; }
+  .controls { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; padding: 12px 16px; background: var(--panel); border-radius: 8px; }
+  button, select { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid #3a4060; background: #1e2540; color: var(--text); cursor: pointer; }
+  button:hover { border-color: var(--gold); }
+  button.rec { border-color: #a33; }
+  button.rec.on { background: #a33; }
+  label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+  #status { color: var(--muted); margin-left: auto; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="c1" width="1920" height="1080"></canvas>
+  <canvas id="c2" width="1920" height="1080"></canvas>
+  <canvas id="c3" width="1920" height="1080"></canvas>
+  <div class="controls">
+    <button id="play">一時停止</button>
+    <button id="reset">最初から</button>
+    <label>速さ <input id="speed" type="range" min="5" max="180" value="45"> <span id="speedVal">45</span>°/秒</label>
+    <label><input id="labels" type="checkbox" checked> 文字を表示</label>
+    <label><input id="sound" type="checkbox" checked> 太鼓の音</label>
+    <label>録画 <select id="recTarget"><option value="0">上の図</option><option value="1">下の図</option><option value="2">足すと10</option></select></label>
+    <button id="recTurn" class="rec">● 1周を録画</button>
+    <button id="rec" class="rec">● 録画開始</button>
+    <span id="status">クリックかキーを押すと音が出ます。スペースキーで再生／一時停止</span>
+  </div>
+</main>
+<script>
+const W = 1920, H = 1080;
+const R = 200; // 円の半径（画面上のピクセル）。数値は r = 1 として出す
+
+// グラフの横幅（横軸は回転角 0〜360°）
+const G = { x0: 1060, x1: 1840 };
+
+const COLOR = {
+  gold: '#d4af37', goldDim: 'rgba(212,175,55,0.22)',
+  a: '#5ec8ff', b: '#ff7ab6', ab: '#f4efe0',
+  grid: 'rgba(255,255,255,0.10)', text: '#e8e2cc', muted: '#8a8ba0',
+};
+const FONT = '"Yu Gothic UI", "Hiragino Sans", sans-serif';
+
+let ctx = null;     // いま描いているキャンバス
+let theta = 0;      // バーが回った角度（度）。2つの図で共通
+let speed = 45;     // 度/秒
+let playing = true;
+let showLabels = true;
+
+// cosθ が 1/2 ずつ変わる角度。A がここに来たら図を光らせ、AB を √ で出す
+const MARK_T = [0, 60, 90, 120, 180, 240, 270, 300];
+const FLASH_SEC = 0.8;
+let flashAge = Infinity; // 最後に光ってからの秒数
+let lastT = null;        // 最後に通った光る角度
+function flash(t) { lastT = t; flashAge = 0; playTaiko(); }
+
+// 太鼓の音。Web Audio でその場で作る（音のファイルは使わない）。
+// ブラウザは操作があるまで音を出せないので、最初のクリックかキーで鳴らせるようにする
+let audio = null;
+let soundOn = true;
+function ensureAudio() {
+  if (!audio) {
+    const ac = new AudioContext();
+    const master = ac.createGain();
+    master.gain.value = 0.7; // 重なっても音が割れないように1.0未満に
+    const rec = ac.createMediaStreamDestination(); // 録画にも音を入れる
+    master.connect(ac.destination);
+    master.connect(rec);
+    audio = { ac, master, rec };
+  }
+  if (audio.ac.state === 'suspended') audio.ac.resume();
+}
+['pointerdown', 'keydown'].forEach(ev => document.addEventListener(ev, ensureAudio));
+
+// ドン：低い音が下がりながら響いて消える。パッ：皮を打つ短いノイズ
+function taikoAt(ac, dest, t0) {
+  const tone = (type, f0, f1, peak, decay) => {
+    const osc = ac.createOscillator();
+    const g = ac.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(f0, t0);
+    osc.frequency.exponentialRampToValueAtTime(f1, t0 + 0.35);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0 + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + decay);
+    osc.connect(g).connect(dest);
+    osc.start(t0);
+    osc.stop(t0 + decay + 0.05);
+  };
+  tone('sine', 125, 62, 1.0, 0.9);       // 胴の響き
+  tone('triangle', 290, 150, 0.18, 0.25); // 打った瞬間の硬さ
+
+  const len = Math.floor(ac.sampleRate * 0.07);
+  const buf = ac.createBuffer(1, len, ac.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len) ** 2;
+  const noise = ac.createBufferSource();
+  noise.buffer = buf;
+  const bp = ac.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = 800;
+  bp.Q.value = 0.9;
+  const g = ac.createGain();
+  g.gain.value = 0.4;
+  noise.connect(bp).connect(g).connect(dest);
+  noise.start(t0);
+}
+function playTaiko() {
+  if (!soundOn || !audio || audio.ac.state !== 'running') return;
+  taikoAt(audio.ac, audio.master, audio.ac.currentTime);
+}
+const flashK = () => Math.max(0, 1 - flashAge / FLASH_SEC);
+
+const gx = t => G.x0 + (t / 360) * (G.x1 - G.x0);
+
+// √n を簡単にした形（√8 → 2√2、√9 → 3）。簡単にならなければ null
+function simplifyRoot(n) {
+  if (n === 0) return '0';
+  let k = 1;
+  for (let i = 2; i * i <= n; i++) if (n % (i * i) === 0) k = i;
+  const m = n / (k * k);
+  if (m === 1) return `${k}`;
+  return k === 1 ? null : `${k}√${m}`;
+}
+
+function dot(p, rad, color) {
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, rad, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+function line(p, q, color, width, dash = []) {
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y);
+  ctx.lineTo(q.x, q.y);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.setLineDash(dash);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+function text(s, x, y, size, color, align = 'left') {
+  ctx.font = `${size}px ${FONT}`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(s, x, y);
+}
+function ripple(p, k, color) {
+  if (k <= 0) return;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 12 + 70 * (1 - k), 0, Math.PI * 2);
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = k;
+  ctx.lineWidth = 4;
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+// 1枚の図。D は2つの円の中心の距離（r = 1 として）。
+// D = 1 は円2の中心が円1の外周上（ヴェシカ・パイシス）、D = 2 は円周で接する。
+// バーAは aStart°から左回り。バーBは bStart°から、bDir = 1 なら左回り、-1 なら右回り。
+// abRefs は AB のグラフの目盛り線にする AB² の値
+function makeScene(canvasId, { D, aStart = 0, bStart = 180, bDir, note, formulaAB, formulaAB2, abRefs }) {
+  const canvas = document.getElementById(canvasId);
+  const C1 = { x: 480 - D * R / 2, y: 540 };
+  const C2 = { x: C1.x + D * R, y: 540 };
+
+  // 画面は y が下向き。左回りは y を引く
+  const pointA = t => {
+    const r = (aStart + t) * Math.PI / 180;
+    return { x: C1.x + R * Math.cos(r), y: C1.y - R * Math.sin(r) };
+  };
+  const pointB = t => {
+    const r = (bStart + bDir * t) * Math.PI / 180;
+    return { x: C2.x + R * Math.cos(r), y: C2.y - R * Math.sin(r) };
+  };
+  // 座標から測った AB の距離（r = 1）
+  const dist = t => {
+    const a = pointA(t), b = pointB(t);
+    return Math.hypot(b.x - a.x, b.y - a.y) / R;
+  };
+
+  // 光る角度での AB²（整数になる）と、その √ の表し方
+  const label = n => simplifyRoot(n) ?? `√${n}`;
+  const marks = MARK_T.map(t => {
+    const n = Math.round(dist(t) ** 2);
+    const s = simplifyRoot(n);
+    return { t, n, root: `√${n}`, exact: s ? ` = ${s}` : '' };
+  });
+  const markAt = t => marks.find(m => m.t === t);
+
+  const ns = [...new Set(marks.map(m => m.n))].sort((x, y) => x - y);
+  // グラフの縦軸の上限は、1周でいちばん長くなるときの AB に少し余白を足す
+  let maxAB = 0;
+  for (let t = 0; t <= 360; t += 0.5) maxAB = Math.max(maxAB, dist(t));
+  const plots = [
+    {
+      y0: 450, y1: 140, max: maxAB * 1.07, value: dist,
+      title: 'AB の距離', formula: formulaAB,
+      refs: (abRefs ?? ns).map(n => [Math.sqrt(n), label(n)]),
+      markLabel: m => m.root,
+    },
+    {
+      y0: 900, y1: 590, max: maxAB ** 2 * 1.07, value: t => dist(t) ** 2,
+      title: 'AB²（AB の二乗）', formula: formulaAB2,
+      refs: ns.map(n => [n, `${n}`]),
+      markLabel: m => `${m.n}`,
+    },
+  ];
+
+  function drawGeometry() {
+    const k = flashK();
+    const a = pointA(theta), b = pointB(theta);
+
+    // 光る：図のまわりをほんのり明るくし、線に光のにじみをつける
+    if (k > 0) {
+      const m = { x: (C1.x + C2.x) / 2, y: C1.y };
+      const glow = ctx.createRadialGradient(m.x, m.y, 0, m.x, m.y, R * 2.4);
+      glow.addColorStop(0, `rgba(212,175,55,${0.22 * k})`);
+      glow.addColorStop(1, 'rgba(212,175,55,0)');
+      ctx.fillStyle = glow;
+      ctx.fillRect(m.x - R * 2.4, m.y - R * 2.4, R * 4.8, R * 4.8);
+    }
+    ctx.shadowColor = '#fff3c4';
+    ctx.shadowBlur = 36 * k;
+
+    for (const c of [C1, C2]) {
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, R, 0, Math.PI * 2);
+      ctx.strokeStyle = COLOR.gold;
+      ctx.lineWidth = 3 + 3 * k;
+      ctx.stroke();
+    }
+    line(a, b, COLOR.ab, 3 + 2 * k, [14, 10]);
+    line(C1, a, COLOR.a, 6);
+    line(C2, b, COLOR.b, 6);
+    dot(C1, 7, COLOR.gold);
+    dot(C2, 7, COLOR.gold);
+    dot(a, 12 + 4 * k, COLOR.a);
+    dot(b, 12 + 4 * k, COLOR.b);
+    ctx.shadowBlur = 0;
+    ripple(a, k, COLOR.a);
+    ripple(b, k, COLOR.b);
+
+    if (!showLabels) return;
+    const last = markAt(lastT);
+    if (last) {
+      text(`θ = ${last.t}° のとき`, 80, 890, 30, COLOR.muted);
+      ctx.shadowColor = '#fff3c4';
+      ctx.shadowBlur = 24 * k;
+      text(`AB = ${last.root}${last.exact}`, 80, 950, 46, COLOR.gold);
+      text(`AB² = ${last.n}`, 80, 1015, 36, COLOR.gold);
+      ctx.shadowBlur = 0;
+    }
+    // 文字は中心から外側へ少しずらして置く
+    const out = (c, p, s) => ({ x: c.x + (p.x - c.x) * s, y: c.y + (p.y - c.y) * s });
+    const la = out(C1, a, 1.18), lb = out(C2, b, 1.18);
+    text('A', la.x, la.y, 40, COLOR.a, 'center');
+    text('B', lb.x, lb.y, 40, COLOR.b, 'center');
+    text('↺ 左回り', C1.x - R + 20, C1.y + R + 60, 30, COLOR.a);
+    text(bDir > 0 ? '↺ 左回り' : '右回り ↻', C2.x + R - 20, C2.y + R + 60, 30, COLOR.b, 'right');
+    text(note, 80, 50, 30, COLOR.muted);
+    text(`θ = ${theta.toFixed(1).padStart(5, ' ')}°`, 80, 110, 40, COLOR.text);
+    text(`AB = ${dist(theta).toFixed(3)}`, 80, 170, 40, COLOR.ab);
+    text(`AB² = ${(dist(theta) ** 2).toFixed(3)}`, 80, 230, 40, COLOR.ab);
+  }
+
+  function drawPlot(P) {
+    const gy = v => P.y0 - (v / P.max) * (P.y0 - P.y1);
+    // 目盛り
+    for (const t of [0, ...MARK_T.slice(1), 360]) {
+      line({ x: gx(t), y: P.y0 }, { x: gx(t), y: P.y1 }, COLOR.grid, 1);
+      if (showLabels) text(`${t}°`, gx(t), P.y0 + 34, 26, COLOR.muted, 'center');
+    }
+    // 目盛りの文字は、下の文字と近すぎるときは省く（線は引く）
+    let lastY = Infinity;
+    for (const [v, lb] of P.refs) {
+      line({ x: G.x0, y: gy(v) }, { x: G.x1, y: gy(v) }, COLOR.goldDim, 2, [8, 8]);
+      if (showLabels && lastY - gy(v) >= 26) {
+        text(lb, G.x0 - 16, gy(v), 28, COLOR.gold, 'right');
+        lastY = gy(v);
+      }
+    }
+    line({ x: G.x0, y: P.y0 }, { x: G.x1, y: P.y0 }, COLOR.muted, 2);
+    line({ x: G.x0, y: P.y0 }, { x: G.x0, y: P.y1 }, COLOR.muted, 2);
+
+    // 1周分の曲線（うすく）と、いままで描いた部分（濃く）
+    const curve = (from, to, color, width) => {
+      ctx.beginPath();
+      for (let t = from; t <= to; t += 0.5) {
+        const x = gx(t), y = gy(P.value(t));
+        t === from ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.lineTo(gx(to), gy(P.value(to)));
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.stroke();
+    };
+    curve(0, 360, COLOR.goldDim, 2);
+    curve(0, theta, COLOR.gold, 5);
+
+    // この周で通りすぎた光る角度の点に印と値を残す
+    for (const m of marks) {
+      if (m.t > theta) continue;
+      const q = { x: gx(m.t), y: gy(P.value(m.t)) };
+      dot(q, 7, COLOR.gold);
+      if (showLabels) text(P.markLabel(m), q.x, q.y - 28, 22, COLOR.gold, 'center');
+    }
+
+    const p = { x: gx(theta), y: gy(P.value(theta)) };
+    line({ x: p.x, y: P.y0 }, p, 'rgba(244,239,224,0.35)', 2, [6, 6]);
+    dot(p, 11, COLOR.ab);
+    ripple(p, flashK(), COLOR.gold);
+
+    if (!showLabels) return;
+    text(P.title, G.x0, P.y1 - 45, 30, COLOR.text);
+    text(P.formula, G.x1, P.y1 - 45, 30, COLOR.gold, 'right');
+  }
+
+  function draw() {
+    ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#070a14';
+    ctx.fillRect(0, 0, W, H);
+    drawGeometry();
+    plots.forEach(drawPlot);
+    if (showLabels) text('回転角 θ', G.x1, plots[1].y0 + 75, 28, COLOR.muted, 'right');
+  }
+
+  return { canvas, D, note, marks, dist, pointA, pointB, draw };
+}
+
+const scenes = [
+  // AB² = 5 − 4cosθ。光る角度で 1, 3, 5, 7, 9
+  makeScene('c1', {
+    D: 1, bDir: 1, note: 'r = 1',
+    formulaAB: 'AB = √(5 − 4 cos θ)', formulaAB2: 'AB² = 5 − 4 cos θ', abRefs: [1, 5, 9],
+  }),
+  // 上の図の A と B の始まりを入れ替えたもの。AB² = 5 + 4cosθ。光る角度で 9, 7, 5, 3, 1
+  makeScene('c2', {
+    D: 1, aStart: 180, bStart: 0, bDir: 1,
+    note: 'r = 1　上の図の A と B の始まりを入れ替え（A は 180°、B は 0° から）',
+    formulaAB: 'AB = √(5 + 4 cos θ)', formulaAB2: 'AB² = 5 + 4 cos θ', abRefs: [1, 5, 9],
+  }),
+];
+
+// いちばん下の図：上の AB² と下の AB² を足すと、いつでも 10。
+// 2本の AB は、辺が 1（中心どうし）と 2（バー2本分）の平行四辺形の2本の対角線で、
+// 対角線の二乗の和 = 4本の辺の二乗の和 = 1² + 2² + 1² + 2² = 10（平行四辺形の法則）
+function makeSumPanel(canvasId, top, bottom) {
+  const canvas = document.getElementById(canvasId);
+  const C_TOP = '#7fd1b9', C_BOTTOM = '#c39bff';
+  const P = { y0: 900, y1: 200, max: 11 };
+  const gy = v => P.y0 - (v / P.max) * (P.y0 - P.y1);
+  const sqTop = t => top.dist(t) ** 2;
+  const sqBottom = t => bottom.dist(t) ** 2;
+
+  function curve(f, from, to, color, width) {
+    ctx.beginPath();
+    for (let t = from; t <= to; t += 0.5) {
+      const x = gx(t), y = gy(f(t));
+      t === from ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.lineTo(gx(to), gy(f(to)));
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.stroke();
+  }
+
+  function draw() {
+    ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#070a14';
+    ctx.fillRect(0, 0, W, H);
+    const k = flashK();
+    const a = sqTop(theta), b = sqBottom(theta);
+
+    // 目盛り
+    for (const t of [0, ...MARK_T.slice(1), 360]) {
+      line({ x: gx(t), y: P.y0 }, { x: gx(t), y: P.y1 }, COLOR.grid, 1);
+      if (showLabels) text(`${t}°`, gx(t), P.y0 + 34, 26, COLOR.muted, 'center');
+    }
+    for (const v of [1, 3, 5, 7, 9]) {
+      line({ x: G.x0, y: gy(v) }, { x: G.x1, y: gy(v) }, COLOR.goldDim, 2, [8, 8]);
+      if (showLabels) text(`${v}`, G.x0 - 16, gy(v), 26, COLOR.muted, 'right');
+    }
+    line({ x: G.x0, y: P.y0 }, { x: G.x1, y: P.y0 }, COLOR.muted, 2);
+    line({ x: G.x0, y: P.y0 }, { x: G.x0, y: P.y1 }, COLOR.muted, 2);
+
+    // 1周分（うすく）と、いままで描いた部分（濃く）。和はいつでも 10 の水平線
+    const sum = t => sqTop(t) + sqBottom(t);
+    curve(sqTop, 0, 360, 'rgba(127,209,185,0.25)', 2);
+    curve(sqBottom, 0, 360, 'rgba(195,155,255,0.25)', 2);
+    curve(sum, 0, 360, COLOR.goldDim, 2);
+    curve(sqTop, 0, theta, C_TOP, 5);
+    curve(sqBottom, 0, theta, C_BOTTOM, 5);
+    ctx.shadowColor = '#fff3c4';
+    ctx.shadowBlur = 20 + 30 * k;
+    curve(sum, 0, theta, COLOR.gold, 6);
+    ctx.shadowBlur = 0;
+    if (showLabels) text('10', G.x0 - 16, gy(10), 32, COLOR.gold, 'right');
+
+    const x = gx(theta);
+    line({ x, y: P.y0 }, { x, y: gy(10) }, 'rgba(244,239,224,0.35)', 2, [6, 6]);
+    for (const [v, color] of [[a, C_TOP], [b, C_BOTTOM], [a + b, COLOR.gold]]) {
+      dot({ x, y: gy(v) }, 10, color);
+      ripple({ x, y: gy(v) }, k, color);
+    }
+
+    // 足し算を積み上げた棒：下に上の図の AB²、その上に下の図の AB²。てっぺんはいつも 10
+    const bx = 900, bw = 70;
+    ctx.fillStyle = C_TOP;
+    ctx.fillRect(bx, gy(a), bw, P.y0 - gy(a));
+    ctx.fillStyle = C_BOTTOM;
+    ctx.fillRect(bx, gy(a + b), bw, gy(a) - gy(a + b));
+    ctx.shadowColor = '#fff3c4';
+    ctx.shadowBlur = 20 + 30 * k;
+    line({ x: bx - 10, y: gy(10) }, { x: bx + bw + 10, y: gy(10) }, COLOR.gold, 4);
+    ctx.shadowBlur = 0;
+
+    if (!showLabels) return;
+    text('上の図の AB² ＋ 下の図の AB² ＝ 10（いつでも）', 80, 80, 44, COLOR.gold);
+    text(`θ = ${theta.toFixed(1).padStart(5, ' ')}°`, 80, 160, 36, COLOR.text);
+    text(`${a.toFixed(3)}`, 80, 220, 40, C_TOP);
+    text('＋', 210, 220, 40, COLOR.text);
+    text(`${b.toFixed(3)}`, 270, 220, 40, C_BOTTOM);
+    text(`＝ ${(a + b).toFixed(3)}`, 400, 220, 40, COLOR.gold);
+
+    const lines = [
+      ['上の図　AB² = 5 − 4 cos θ', C_TOP],
+      ['下の図　AB² = 5 + 4 cos θ', C_BOTTOM],
+      ['足すと　cos θ の分が打ち消し合って 10', COLOR.gold],
+      ['', null],
+      ['わけ：2本の AB は、辺が 1 と 2 の', COLOR.text],
+      ['平行四辺形の、2本の対角線になっている。', COLOR.text],
+      ['対角線の二乗の和は、4本の辺の二乗の和と等しい。', COLOR.text],
+      ['1² + 2² + 1² + 2² = 10', COLOR.gold],
+    ];
+    lines.forEach(([s, color], i) => { if (s) text(s, 80, 340 + i * 58, 30, color); });
+
+    text('AB²', G.x0, P.y1 - 45, 30, COLOR.text);
+    text('■ 上の図', G.x1 - 330, P.y1 - 45, 28, C_TOP);
+    text('■ 下の図', G.x1 - 190, P.y1 - 45, 28, C_BOTTOM);
+    text('■ 和', G.x1 - 50, P.y1 - 45, 28, COLOR.gold);
+    text('回転角 θ', G.x1, P.y0 + 75, 28, COLOR.muted, 'right');
+  }
+
+  return { canvas, draw };
+}
+scenes.push(makeSumPanel('c3', scenes[0], scenes[1]));
+const drawAll = () => scenes.forEach(s => s.draw());
+
+// 録画（選んだ図の canvas だけを webm に書き出す。操作パネルは映らない）
+let recorder = null, chunks = [], stopAtTurn = false;
+const recBtn = document.getElementById('rec');
+const recTurnBtn = document.getElementById('recTurn');
+const recTarget = document.getElementById('recTarget');
+const status = document.getElementById('status');
+
+function stamp() {
+  const d = new Date(), z = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
+}
+function startRecording() {
+  const scene = scenes[+recTarget.value];
+  const types = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  const mimeType = types.find(t => MediaRecorder.isTypeSupported(t)) || '';
+  // 映像は canvas、音は太鼓（鳴らせる状態なら）
+  const tracks = scene.canvas.captureStream(60).getVideoTracks();
+  if (audio) tracks.push(...audio.rec.stream.getAudioTracks());
+  recorder = new MediaRecorder(new MediaStream(tracks), { mimeType, videoBitsPerSecond: 12_000_000 });
+  chunks = [];
+  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `二円の回転ver3_${['上の図', '下の図', '足すと10'][scenes.indexOf(scene)]}_${stamp()}.webm`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    recorder = null;
+    stopAtTurn = false;
+    recBtn.textContent = '● 録画開始';
+    recBtn.classList.remove('on');
+    recTurnBtn.classList.remove('on');
+    recTarget.disabled = false;
+    status.textContent = '録画を保存しました';
+  };
+  recorder.start();
+  recTarget.disabled = true;
+  recBtn.textContent = '■ 録画停止';
+  recBtn.classList.add('on');
+  status.textContent = '録画中…';
+}
+recBtn.onclick = () => recorder ? recorder.stop() : startRecording();
+recTurnBtn.onclick = () => {
+  if (recorder) return;
+  theta = 0;
+  flash(0);
+  playing = true;
+  playBtn.textContent = '一時停止';
+  stopAtTurn = true;
+  recTurnBtn.classList.add('on');
+  startRecording();
+};
+
+// 操作
+const playBtn = document.getElementById('play');
+const togglePlay = () => { playing = !playing; playBtn.textContent = playing ? '一時停止' : '再生'; };
+playBtn.onclick = togglePlay;
+document.getElementById('reset').onclick = () => { theta = 0; flash(0); };
+const speedInput = document.getElementById('speed');
+speedInput.oninput = () => { speed = +speedInput.value; document.getElementById('speedVal').textContent = speed; };
+document.getElementById('labels').onchange = e => { showLabels = e.target.checked; };
+document.getElementById('sound').onchange = e => { soundOn = e.target.checked; };
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !['INPUT', 'SELECT'].includes(e.target.tagName)) { e.preventDefault(); togglePlay(); }
+});
+
+flash(0);
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  flashAge += dt;
+  if (playing) {
+    const before = theta;
+    theta += speed * dt;
+    // このフレームで通りすぎた光る角度（360° は 0° として光る）
+    const passed = MARK_T.filter(t => before < t && t <= theta);
+    if (before < 360 && theta >= 360) passed.push(0);
+    if (passed.length) flash(passed[passed.length - 1]);
+    if (theta >= 360) {
+      if (stopAtTurn && recorder) {
+        // 最後の光が消えるまで録ってから止める
+        theta = 360;
+        playing = false;
+        playBtn.textContent = '再生';
+        stopAtTurn = false;
+        const rec = recorder;
+        setTimeout(() => rec.state !== 'inactive' && rec.stop(), FLASH_SEC * 1000);
+      } else {
+        theta -= 360;
+      }
+    }
+  }
+  drawAll();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
