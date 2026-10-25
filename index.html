@@ -11,33 +11,33 @@
   main { max-width: 1280px; margin: 0 auto; padding: 16px; }
   canvas { width: 100%; height: auto; display: block; border-radius: 8px; background: #070a14; margin-bottom: 16px; }
   .controls { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; padding: 12px 16px; background: var(--panel); border-radius: 8px; }
-  button, select { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid #3a4060; background: #1e2540; color: var(--text); cursor: pointer; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid #3a4060; background: #1e2540; color: var(--text); cursor: pointer; }
   button:hover { border-color: var(--gold); }
-  button.rec { border-color: #a33; }
-  button.rec.on { background: #a33; }
+  /* 最初から（|◀）と、再生（▶）／一時停止（⏸）は図形のボタン */
+  button.icon { width: 52px; height: 40px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+  button.icon svg { width: 22px; height: 22px; fill: currentColor; }
   label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
-  #status { color: var(--muted); margin-left: auto; }
-  /* 消音ボタン：画面の右上に固定。スクロールしてもついてくる */
-  #mute { position: fixed; top: 16px; right: 16px; z-index: 10; padding: 10px 16px; font-size: 18px; background: rgba(20,26,46,0.9); box-shadow: 0 2px 10px rgba(0,0,0,0.4); }
+  #mute { margin-left: auto; }
   #mute.off { border-color: #a33; }
+  /* スマホの幅：ボタンを上の段、速さのスライダーを下の段にまとめる */
+  @media (max-width: 600px) {
+    .controls { gap: 10px 12px; }
+    #mute { order: 1; }
+    #speedLabel { order: 2; flex: 1 1 100%; }
+    #speed { flex: 1; min-width: 0; }
+  }
 </style>
 </head>
 <body>
-<button id="mute" aria-pressed="false">🔊 音あり</button>
 <main>
   <canvas id="c1" width="1920" height="1080"></canvas>
   <canvas id="c2" width="1920" height="1080"></canvas>
   <canvas id="c3" width="1920" height="1080"></canvas>
   <div class="controls">
-    <button id="play">一時停止</button>
-    <button id="reset">最初から</button>
-    <label>速さ <input id="speed" type="range" min="5" max="180" value="45"> <span id="speedVal">45</span>°/秒</label>
-    <label><input id="labels" type="checkbox" checked> 文字を表示</label>
-    <label><input id="sound" type="checkbox" checked> 太鼓の音</label>
-    <label>録画 <select id="recTarget"><option value="0">上の図</option><option value="1">下の図</option><option value="2">足すと10</option></select></label>
-    <button id="recTurn" class="rec">● 1周を録画</button>
-    <button id="rec" class="rec">● 録画開始</button>
-    <span id="status">クリックかキーを押すと音が出ます。スペースキーで再生／一時停止</span>
+    <button id="reset" class="icon" aria-label="最初から" title="最初から"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="3" height="14"/><path d="M20 5v14L8 12z"/></svg></button>
+    <button id="play" class="icon"></button>
+    <label id="speedLabel">速さ <input id="speed" type="range" min="5" max="180" value="45"> <span id="speedVal">45</span>°/秒</label>
+    <button id="mute" aria-pressed="false">🔊 音あり</button>
   </div>
 </main>
 <script>
@@ -76,10 +76,8 @@ function ensureAudio() {
     const ac = new AudioContext();
     const master = ac.createGain();
     master.gain.value = 0.7; // 重なっても音が割れないように1.0未満に
-    const rec = ac.createMediaStreamDestination(); // 録画にも音を入れる
     master.connect(ac.destination);
-    master.connect(rec);
-    audio = { ac, master, rec };
+    audio = { ac, master };
   }
   if (audio.ac.state === 'suspended') audio.ac.resume();
 }
@@ -462,82 +460,33 @@ function makeSumPanel(canvasId, top, bottom) {
 scenes.push(makeSumPanel('c3', scenes[0], scenes[1]));
 const drawAll = () => scenes.forEach(s => s.draw());
 
-// 録画（選んだ図の canvas だけを webm に書き出す。操作パネルは映らない）
-let recorder = null, chunks = [], stopAtTurn = false;
-const recBtn = document.getElementById('rec');
-const recTurnBtn = document.getElementById('recTurn');
-const recTarget = document.getElementById('recTarget');
-const status = document.getElementById('status');
-
-function stamp() {
-  const d = new Date(), z = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
-}
-function startRecording() {
-  const scene = scenes[+recTarget.value];
-  const types = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
-  const mimeType = types.find(t => MediaRecorder.isTypeSupported(t)) || '';
-  // 映像は canvas、音は太鼓（鳴らせる状態なら）
-  const tracks = scene.canvas.captureStream(60).getVideoTracks();
-  if (audio) tracks.push(...audio.rec.stream.getAudioTracks());
-  recorder = new MediaRecorder(new MediaStream(tracks), { mimeType, videoBitsPerSecond: 12_000_000 });
-  chunks = [];
-  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-  recorder.onstop = () => {
-    const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `二円の回転ver3_${['上の図', '下の図', '足すと10'][scenes.indexOf(scene)]}_${stamp()}.webm`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-    recorder = null;
-    stopAtTurn = false;
-    recBtn.textContent = '● 録画開始';
-    recBtn.classList.remove('on');
-    recTurnBtn.classList.remove('on');
-    recTarget.disabled = false;
-    status.textContent = '録画を保存しました';
-  };
-  recorder.start();
-  recTarget.disabled = true;
-  recBtn.textContent = '■ 録画停止';
-  recBtn.classList.add('on');
-  status.textContent = '録画中…';
-}
-recBtn.onclick = () => recorder ? recorder.stop() : startRecording();
-recTurnBtn.onclick = () => {
-  if (recorder) return;
-  theta = 0;
-  flash(0);
-  playing = true;
-  playBtn.textContent = '一時停止';
-  stopAtTurn = true;
-  recTurnBtn.classList.add('on');
-  startRecording();
-};
-
 // 操作
+// 再生中は一時停止（⏸）、止まっているときは再生（▶）のボタンを出す
 const playBtn = document.getElementById('play');
-const togglePlay = () => { playing = !playing; playBtn.textContent = playing ? '一時停止' : '再生'; };
+const ICON_PLAY = '<svg viewBox="0 0 24 24"><path d="M7 4v16l13-8z"/></svg>';
+const ICON_PAUSE = '<svg viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>';
+function updatePlayBtn() {
+  playBtn.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
+  playBtn.setAttribute('aria-label', playing ? '一時停止' : '再生');
+  playBtn.title = playing ? '一時停止' : '再生';
+}
+const togglePlay = () => { playing = !playing; updatePlayBtn(); };
 playBtn.onclick = togglePlay;
+updatePlayBtn();
 document.getElementById('reset').onclick = () => { theta = 0; flash(0); };
 const speedInput = document.getElementById('speed');
 speedInput.oninput = () => { speed = +speedInput.value; document.getElementById('speedVal').textContent = speed; };
-document.getElementById('labels').onchange = e => { showLabels = e.target.checked; };
-// 音のオンオフ：右上の消音ボタンと、操作パネルの「太鼓の音」はいつも同じ状態にそろえる
+// 音のオンオフ
 const muteBtn = document.getElementById('mute');
-const soundBox = document.getElementById('sound');
 function setSound(on) {
   soundOn = on;
-  soundBox.checked = on;
   muteBtn.textContent = on ? '🔊 音あり' : '🔇 消音中';
   muteBtn.classList.toggle('off', !on);
   muteBtn.setAttribute('aria-pressed', String(!on));
 }
 muteBtn.onclick = () => setSound(!soundOn);
-soundBox.onchange = e => setSound(e.target.checked);
 document.addEventListener('keydown', e => {
-  if (e.code === 'Space' && !['INPUT', 'SELECT'].includes(e.target.tagName)) { e.preventDefault(); togglePlay(); }
+  if (e.code === 'Space' && e.target.tagName !== 'INPUT') { e.preventDefault(); togglePlay(); }
 });
 
 flash(0);
@@ -553,19 +502,7 @@ function frame(now) {
     const passed = MARK_T.filter(t => before < t && t <= theta);
     if (before < 360 && theta >= 360) passed.push(0);
     if (passed.length) flash(passed[passed.length - 1]);
-    if (theta >= 360) {
-      if (stopAtTurn && recorder) {
-        // 最後の光が消えるまで録ってから止める
-        theta = 360;
-        playing = false;
-        playBtn.textContent = '再生';
-        stopAtTurn = false;
-        const rec = recorder;
-        setTimeout(() => rec.state !== 'inactive' && rec.stop(), FLASH_SEC * 1000);
-      } else {
-        theta -= 360;
-      }
-    }
+    if (theta >= 360) theta -= 360;
   }
   drawAll();
   requestAnimationFrame(frame);
