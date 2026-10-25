@@ -2,7 +2,7 @@
 
 試作所・神秘部の図を見せるための公開用リポジトリ。GitHub Pages で公開している。
 
-- https://keeponbeat.github.io/shinpibu/ — 二円の回転 ver3（上の図・下の図・足すと10）
+- https://keeponbeat.github.io/shinpibu/ — マンドルラ・ルート奇数理論（二円の回転 ver3：上の図・下の図・足すと10）
 
 ## 更新のしかた
 
